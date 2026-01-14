@@ -46,6 +46,7 @@ const GUILD_ID = "1460760771268051059";
 const TICKET_CATEGORY_ID = "1460924804424142973";
 const AUTO_ROLE_ID = "1460922502263079052";
 const MUTED_ROLE_ID = "1460922503437488138";
+const APPLICATION_REVIEW_CHANNEL_ID = "1460965699215167643";
 
 const STAFF_ROLE_IDS = [
   "1460922472328335404",
@@ -885,8 +886,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const settings = getGuildSettings(guild.id);
 
       const appCategoryId = settings.application_category_id;
-      const reviewChannelId = settings.application_channel_id;
-      if (!appCategoryId || !reviewChannelId) {
+      if (!appCategoryId) {
         return safeReply(interaction, {
           content:
             "❌ Applications are not configured. Staff must run `/set application` first.",
@@ -971,7 +971,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await appChannel.send({ content: `<@${user.id}>`, embeds: [embed], components: [row] });
 
-      const reviewChannel = await guild.channels.fetch(reviewChannelId).catch(() => null);
+      const reviewChannel = await guild.channels
+        .fetch(APPLICATION_REVIEW_CHANNEL_ID)
+        .catch(() => null);
       if (reviewChannel && "send" in reviewChannel) {
         await reviewChannel.send({
           content: `📝 New application from <@${user.id}> in ${appChannel}`,
@@ -1115,7 +1117,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           console.warn("⚠️ Could not send apply panel:", err);
         }
         return safeReply(interaction, {
-          content: `✅ Application settings saved.\nCategory: <#${next.application_category_id}>\nPanel channel: <#${next.application_channel_id}>\n\nI posted the **Apply Now (Moderator)** panel embed in the panel channel.`,
+          content: `✅ Application settings saved.\nCategory: <#${next.application_category_id}>\nPanel channel: <#${next.application_channel_id}>\nReview channel: <#${APPLICATION_REVIEW_CHANNEL_ID}>\n\nI posted the **Apply Now (Moderator)** panel embed in the panel channel.`,
           ephemeral: true,
         });
       }
@@ -1155,7 +1157,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
             name: "Applications",
             value: [
               `Category: ${s.application_category_id ? `<#${s.application_category_id}>` : "(not set)"}`,
-              `Review channel: ${s.application_channel_id ? `<#${s.application_channel_id}>` : "(not set)"}`,
+              `Panel channel: ${s.application_channel_id ? `<#${s.application_channel_id}>` : "(not set)"}`,
+              `Review channel: <#${APPLICATION_REVIEW_CHANNEL_ID}>`,
             ].join("\n"),
           },
           {
