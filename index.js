@@ -21,7 +21,7 @@
 
 require("dotenv").config();
 
-const { DatabaseSync } = require("node:sqlite");
+const Database = require("better-sqlite3");
 
 const {
   ActionRowBuilder,
@@ -63,7 +63,7 @@ if (!BOT_TOKEN) {
 }
 
 // ---- SQLite (single-file persistence) ----
-const db = new DatabaseSync("bot.sqlite");
+const db = new Database("bot.sqlite");
 try {
   db.exec("PRAGMA journal_mode=WAL;");
   db.exec("PRAGMA foreign_keys=ON;");
