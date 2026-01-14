@@ -221,6 +221,50 @@ function getApplicationOwnerIdFromChannel(channel) {
   return m ? m[1] : null;
 }
 
+function buildTicketPanelEmbed() {
+  return new EmbedBuilder()
+    .setTitle("🎫 Create a Ticket")
+    .setDescription(
+      [
+        "Need help from staff?",
+        "Click the button below to create a private support ticket.",
+      ].join("\n")
+    )
+    .setColor(0x5865f2);
+}
+
+function buildApplyPanelEmbed() {
+  return new EmbedBuilder()
+    .setTitle("📝 Apply Now (Moderator)")
+    .setDescription(
+      [
+        "Want to join the team?",
+        "Click the button below to apply for **Moderator**.",
+      ].join("\n")
+    )
+    .setColor(0x57f287);
+}
+
+function buildDecisionEmbed(decision, staffUser, reason) {
+  const approved = decision === "approved";
+  return new EmbedBuilder()
+    .setTitle(approved ? "✅ Application Approved" : "❌ Application Denied")
+    .setDescription(
+      [
+        approved
+          ? "Congratulations! Your application for **Moderator** has been approved."
+          : "Your application for **Moderator** has been denied.",
+        "",
+        staffUser ? `Reviewed by: ${staffUser.tag}` : null,
+        reason ? `Reason: ${reason}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n")
+    )
+    .setColor(approved ? 0x57f287 : 0xed4245)
+    .setTimestamp();
+}
+
 async function safeReply(interaction, payload) {
   try {
     if (interaction.deferred || interaction.replied) {
@@ -244,6 +288,98 @@ async function logToAppLogs(guild, content, embeds = []) {
   } catch (err) {
     console.warn("⚠️ applogs send failed:", err);
   }
+}
+
+async function sendTicketPanelToChannel(channel) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("panel_ticket_create")
+      .setLabel("Create a Ticket")
+      .setStyle(ButtonStyle.Primary)
+  );
+  await channel.send({ embeds: [buildTicketPanelEmbed()], components: [row] });
+}
+
+async function sendApplyPanelToChannel(channel) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("panel_apply_open")
+      .setLabel("Apply Now")
+      .setStyle(ButtonStyle.Success)
+  );
+  await channel.send({ embeds: [buildApplyPanelEmbed()], components: [row] });
+}
+
+async function createTicketForUser(guild, user) {
+  const settings = getGuildSettings(guild.id);
+  const ticketCategoryId = settings.ticket_category_id || TICKET_CATEGORY_ID;
+
+  // Ensure cache is populated enough to find existing channels reliably.
+  try {
+    await guild.channels.fetch();
+  } catch {
+    // ignore
+  }
+
+  const existing = guild.channels.cache.find(
+    (c) => c.name === `ticket-${user.id}` && c.parentId === ticketCategoryId
+  );
+  if (existing) return { channel: existing, alreadyExisted: true };
+
+  const channel = await guild.channels.create({
+    name: `ticket-${user.id}`,
+    type: ChannelType.GuildText,
+    parent: ticketCategoryId,
+    topic: `Ticket owner: ${user.tag} (${user.id})`,
+    permissionOverwrites: [
+      {
+        id: guild.id,
+        deny: [PermissionFlagsBits.ViewChannel],
+      },
+      {
+        id: user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+        ],
+      },
+      ...STAFF_ROLE_IDS.map((id) => ({
+        id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+        ],
+      })),
+    ],
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle("🎫 Support Ticket")
+    .setDescription(
+      [
+        `Hi ${user}, please describe your issue and staff will help you.`,
+        "",
+        "When you're done, you (or staff) can close the ticket with the button below.",
+      ].join("\n")
+    )
+    .setColor(0x5865f2);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("ticket_close")
+      .setLabel("Close ticket")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({
+    content: `<@${user.id}>`,
+    embeds: [embed],
+    components: [row],
+  });
+
+  return { channel, alreadyExisted: false };
 }
 
 async function applyPermanentMute(member, reason) {
@@ -600,6 +736,72 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      // Panel button: create ticket
+      if (interaction.customId === "panel_ticket_create") {
+        if (!interaction.inGuild()) {
+          return safeReply(interaction, {
+            content: "❌ This button can only be used in a server.",
+            ephemeral: true,
+          });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+        const { channel, alreadyExisted } = await createTicketForUser(
+          interaction.guild,
+          interaction.user
+        );
+        return safeReply(interaction, {
+          content: alreadyExisted
+            ? `❗ You already have an open ticket: ${channel}`
+            : `✅ Your ticket has been created: ${channel}`,
+          ephemeral: true,
+        });
+      }
+
+      // Panel button: open application modal
+      if (interaction.customId === "panel_apply_open") {
+        if (!interaction.inGuild()) {
+          return safeReply(interaction, {
+            content: "❌ This button can only be used in a server.",
+            ephemeral: true,
+          });
+        }
+
+        const modal = new ModalBuilder()
+          .setCustomId("application_modal")
+          .setTitle("Moderator Application");
+
+        const age = new TextInputBuilder()
+          .setCustomId("age")
+          .setLabel("Age")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(3);
+
+        const experience = new TextInputBuilder()
+          .setCustomId("experience")
+          .setLabel("Experience (short)")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(1000);
+
+        const why = new TextInputBuilder()
+          .setCustomId("why")
+          .setLabel("Why do you want to be a Moderator?")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(1000);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(age),
+          new ActionRowBuilder().addComponents(experience),
+          new ActionRowBuilder().addComponents(why)
+        );
+
+        await interaction.showModal(modal);
+        return;
+      }
+
       // Application approve/deny
       if (interaction.customId.startsWith("app_")) {
         if (!interaction.inGuild()) {
@@ -628,7 +830,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         if (action === "app_approve") {
           if (targetMember) {
-            await targetMember.send("✅ Your application has been approved.").catch(() => null);
+            await targetMember
+              .send({
+                embeds: [
+                  buildDecisionEmbed(
+                    "approved",
+                    interaction.user,
+                    "You have been accepted as Moderator."
+                  ),
+                ],
+              })
+              .catch(() => null);
           }
           await logToAppLogs(guild, `✅ Application approved for <@${userId}> by <@${interaction.user.id}>.`);
           if (appChannel && "delete" in appChannel) await appChannel.delete("Application approved").catch(() => null);
@@ -637,7 +849,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         if (action === "app_deny") {
           if (targetMember) {
-            await targetMember.send("❌ Your application has been denied.").catch(() => null);
+            await targetMember
+              .send({
+                embeds: [buildDecisionEmbed("denied", interaction.user)],
+              })
+              .catch(() => null);
           }
           await logToAppLogs(guild, `❌ Application denied for <@${userId}> by <@${interaction.user.id}>.`);
           if (appChannel && "delete" in appChannel) await appChannel.delete("Application denied").catch(() => null);
@@ -808,80 +1024,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === "ticket") {
       const guild = interaction.guild;
       const user = interaction.user;
-      const settings = getGuildSettings(guild.id);
-      const ticketCategoryId = settings.ticket_category_id || TICKET_CATEGORY_ID;
-
-      // Ensure cache is populated enough to find existing channels reliably.
-      try {
-        await guild.channels.fetch();
-      } catch (err) {
-        console.warn("⚠️ Could not fetch channels (continuing):", err);
-      }
-
-      const existing = guild.channels.cache.find(
-        (c) => c.name === `ticket-${user.id}` && c.parentId === ticketCategoryId
-      );
-
-      if (existing) {
-        return safeReply(interaction, {
-          content: `❗ You already have an open ticket: ${existing}`,
-          ephemeral: true,
-        });
-      }
-
       await interaction.deferReply({ ephemeral: true });
-
-      const channel = await guild.channels.create({
-        name: `ticket-${user.id}`,
-        type: ChannelType.GuildText,
-        parent: ticketCategoryId,
-        topic: `Ticket owner: ${user.tag} (${user.id})`,
-        permissionOverwrites: [
-          {
-            id: guild.id,
-            deny: [PermissionFlagsBits.ViewChannel],
-          },
-          {
-            id: user.id,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-            ],
-          },
-          ...STAFF_ROLE_IDS.map((id) => ({
-            id,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-            ],
-          })),
-        ],
-      });
-
-      const embed = new EmbedBuilder()
-        .setTitle("✅ Ticket created")
-        .setDescription(
-          [
-            `Hi ${user}, describe your issue here and staff will help you.`,
-            "",
-            "When you're done, you (or staff) can close the ticket with the button below.",
-          ].join("\n")
-        )
-        .setColor(0x2ecc71);
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("ticket_close")
-          .setLabel("Close ticket")
-          .setStyle(ButtonStyle.Danger)
-      );
-
-      await channel.send({ content: `<@${user.id}>`, embeds: [embed], components: [row] });
-
+      const { channel, alreadyExisted } = await createTicketForUser(guild, user);
       return safeReply(interaction, {
-        content: `✅ Your ticket has been created: ${channel}`,
+        content: alreadyExisted
+          ? `❗ You already have an open ticket: ${channel}`
+          : `✅ Your ticket has been created: ${channel}`,
         ephemeral: true,
       });
     }
@@ -891,7 +1039,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       // Show modal for application content
       const modal = new ModalBuilder()
         .setCustomId("application_modal")
-        .setTitle("Staff Application");
+        .setTitle("Moderator Application");
 
       const age = new TextInputBuilder()
         .setCustomId("age")
@@ -909,7 +1057,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const why = new TextInputBuilder()
         .setCustomId("why")
-        .setLabel("Why do you want to be staff?")
+        .setLabel("Why do you want to be a Moderator?")
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true)
         .setMaxLength(1000);
@@ -943,8 +1091,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
           ticket_category_id: category.id,
           ticket_channel_id: channel.id,
         });
+        try {
+          await sendTicketPanelToChannel(channel);
+        } catch (err) {
+          console.warn("⚠️ Could not send ticket panel:", err);
+        }
         return safeReply(interaction, {
-          content: `✅ Ticket settings saved.\nCategory: <#${next.ticket_category_id}>\nChannel: <#${next.ticket_channel_id}>`,
+          content: `✅ Ticket settings saved.\nCategory: <#${next.ticket_category_id}>\nPanel channel: <#${next.ticket_channel_id}>\n\nI posted the **Create a Ticket** panel embed in the panel channel.`,
           ephemeral: true,
         });
       }
@@ -956,8 +1109,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
           application_category_id: category.id,
           application_channel_id: channel.id,
         });
+        try {
+          await sendApplyPanelToChannel(channel);
+        } catch (err) {
+          console.warn("⚠️ Could not send apply panel:", err);
+        }
         return safeReply(interaction, {
-          content: `✅ Application settings saved.\nCategory: <#${next.application_category_id}>\nReview channel: <#${next.application_channel_id}>`,
+          content: `✅ Application settings saved.\nCategory: <#${next.application_category_id}>\nPanel channel: <#${next.application_channel_id}>\n\nI posted the **Apply Now (Moderator)** panel embed in the panel channel.`,
           ephemeral: true,
         });
       }
