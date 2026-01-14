@@ -79,9 +79,39 @@ CREATE TABLE IF NOT EXISTS guild_settings (
   application_category_id TEXT,
   application_channel_id TEXT,
   applogs_category_id TEXT,
-  applogs_channel_id TEXT
+  applogs_channel_id TEXT,
+  automod_link_enabled INTEGER NOT NULL DEFAULT 1,
+  automod_link_action TEXT NOT NULL DEFAULT 'adwarn',
+  automod_link_delete INTEGER NOT NULL DEFAULT 1,
+  automod_caps_enabled INTEGER NOT NULL DEFAULT 1,
+  automod_caps_ratio REAL NOT NULL DEFAULT 0.75,
+  automod_caps_min_letters INTEGER NOT NULL DEFAULT 8,
+  automod_caps_min_len INTEGER NOT NULL DEFAULT 12,
+  automod_caps_cooldown_ms INTEGER NOT NULL DEFAULT 30000,
+  autoban_warn_threshold INTEGER NOT NULL DEFAULT 3,
+  adwarn_mute_threshold INTEGER NOT NULL DEFAULT 3
 );
 `);
+
+function ensureColumn(table, columnDef) {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef};`);
+  } catch {
+    // Column likely exists already.
+  }
+}
+
+// Backfill columns for older DBs
+ensureColumn("guild_settings", "automod_link_enabled INTEGER NOT NULL DEFAULT 1");
+ensureColumn("guild_settings", "automod_link_action TEXT NOT NULL DEFAULT 'adwarn'");
+ensureColumn("guild_settings", "automod_link_delete INTEGER NOT NULL DEFAULT 1");
+ensureColumn("guild_settings", "automod_caps_enabled INTEGER NOT NULL DEFAULT 1");
+ensureColumn("guild_settings", "automod_caps_ratio REAL NOT NULL DEFAULT 0.75");
+ensureColumn("guild_settings", "automod_caps_min_letters INTEGER NOT NULL DEFAULT 8");
+ensureColumn("guild_settings", "automod_caps_min_len INTEGER NOT NULL DEFAULT 12");
+ensureColumn("guild_settings", "automod_caps_cooldown_ms INTEGER NOT NULL DEFAULT 30000");
+ensureColumn("guild_settings", "autoban_warn_threshold INTEGER NOT NULL DEFAULT 3");
+ensureColumn("guild_settings", "adwarn_mute_threshold INTEGER NOT NULL DEFAULT 3");
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS user_punishments (
@@ -103,6 +133,25 @@ CREATE TABLE IF NOT EXISTS mute_state (
 );
 `);
 
+db.exec(`
+CREATE TABLE IF NOT EXISTS channel_locks (
+  guild_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  locked_at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, channel_id)
+);
+`);
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS user_notes (
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  note TEXT NOT NULL,
+  staff_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+`);
+
 const stmtGetSettings = db.prepare(
   "SELECT * FROM guild_settings WHERE guild_id = ?"
 );
@@ -111,15 +160,28 @@ INSERT INTO guild_settings (
   guild_id,
   ticket_category_id, ticket_channel_id,
   application_category_id, application_channel_id,
-  applogs_category_id, applogs_channel_id
-) VALUES (?, ?, ?, ?, ?, ?, ?)
+  applogs_category_id, applogs_channel_id,
+  automod_link_enabled, automod_link_action, automod_link_delete,
+  automod_caps_enabled, automod_caps_ratio, automod_caps_min_letters, automod_caps_min_len, automod_caps_cooldown_ms,
+  autoban_warn_threshold, adwarn_mute_threshold
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(guild_id) DO UPDATE SET
   ticket_category_id=excluded.ticket_category_id,
   ticket_channel_id=excluded.ticket_channel_id,
   application_category_id=excluded.application_category_id,
   application_channel_id=excluded.application_channel_id,
   applogs_category_id=excluded.applogs_category_id,
-  applogs_channel_id=excluded.applogs_channel_id
+  applogs_channel_id=excluded.applogs_channel_id,
+  automod_link_enabled=excluded.automod_link_enabled,
+  automod_link_action=excluded.automod_link_action,
+  automod_link_delete=excluded.automod_link_delete,
+  automod_caps_enabled=excluded.automod_caps_enabled,
+  automod_caps_ratio=excluded.automod_caps_ratio,
+  automod_caps_min_letters=excluded.automod_caps_min_letters,
+  automod_caps_min_len=excluded.automod_caps_min_len,
+  automod_caps_cooldown_ms=excluded.automod_caps_cooldown_ms,
+  autoban_warn_threshold=excluded.autoban_warn_threshold,
+  adwarn_mute_threshold=excluded.adwarn_mute_threshold
 `);
 
 const stmtGetPunish = db.prepare(
@@ -150,9 +212,35 @@ const stmtDeleteMute = db.prepare(
   "DELETE FROM mute_state WHERE guild_id = ? AND user_id = ?"
 );
 
+const stmtLockChannel = db.prepare(
+  "INSERT INTO channel_locks (guild_id, channel_id, locked_at) VALUES (?, ?, ?) ON CONFLICT(guild_id, channel_id) DO UPDATE SET locked_at=excluded.locked_at"
+);
+const stmtUnlockChannel = db.prepare(
+  "DELETE FROM channel_locks WHERE guild_id = ? AND channel_id = ?"
+);
+const stmtIsLocked = db.prepare(
+  "SELECT locked_at FROM channel_locks WHERE guild_id = ? AND channel_id = ?"
+);
+
+const stmtAddNote = db.prepare(
+  "INSERT INTO user_notes (guild_id, user_id, note, staff_id, created_at) VALUES (?, ?, ?, ?, ?)"
+);
+const stmtGetNotes = db.prepare(
+  "SELECT note, staff_id, created_at FROM user_notes WHERE guild_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?"
+);
+const stmtClearNotes = db.prepare(
+  "DELETE FROM user_notes WHERE guild_id = ? AND user_id = ?"
+);
+
+const settingsCache = new Map(); // guildId -> { ts, value }
+const SETTINGS_TTL_MS = 10_000;
+
 function getGuildSettings(guildId) {
+  const cached = settingsCache.get(guildId);
+  if (cached && Date.now() - cached.ts < SETTINGS_TTL_MS) return cached.value;
+
   const row = stmtGetSettings.get(guildId);
-  return (
+  const value =
     row ?? {
       guild_id: guildId,
       ticket_category_id: null,
@@ -161,8 +249,20 @@ function getGuildSettings(guildId) {
       application_channel_id: null,
       applogs_category_id: null,
       applogs_channel_id: null,
-    }
-  );
+      automod_link_enabled: 1,
+      automod_link_action: "adwarn",
+      automod_link_delete: 1,
+      automod_caps_enabled: 1,
+      automod_caps_ratio: 0.75,
+      automod_caps_min_letters: 8,
+      automod_caps_min_len: 12,
+      automod_caps_cooldown_ms: 30000,
+      autoban_warn_threshold: 3,
+      adwarn_mute_threshold: 3,
+    };
+
+  settingsCache.set(guildId, { ts: Date.now(), value });
+  return value;
 }
 
 function saveGuildSettings(guildId, patch) {
@@ -175,8 +275,19 @@ function saveGuildSettings(guildId, patch) {
     next.application_category_id,
     next.application_channel_id,
     next.applogs_category_id,
-    next.applogs_channel_id
+    next.applogs_channel_id,
+    Number(next.automod_link_enabled ?? 1),
+    String(next.automod_link_action ?? "adwarn"),
+    Number(next.automod_link_delete ?? 1),
+    Number(next.automod_caps_enabled ?? 1),
+    Number(next.automod_caps_ratio ?? 0.75),
+    Number(next.automod_caps_min_letters ?? 8),
+    Number(next.automod_caps_min_len ?? 12),
+    Number(next.automod_caps_cooldown_ms ?? 30000),
+    Number(next.autoban_warn_threshold ?? 3),
+    Number(next.adwarn_mute_threshold ?? 3)
   );
+  settingsCache.set(guildId, { ts: Date.now(), value: next });
   return next;
 }
 
@@ -448,19 +559,20 @@ async function addWarn(guild, userId, reason, source = "manual") {
     `⚠️ Warn: <@${userId}> (warns=${warns}/3) | source=${source} | ${reason || "No reason"}`
   );
 
-  // Auto-ban at 3 warns
-  if (warns >= 3) {
+  // Auto-ban at configured threshold
+  const threshold = Number(getGuildSettings(guild.id).autoban_warn_threshold ?? 3);
+  if (warns >= threshold) {
     const member = await guild.members.fetch(userId).catch(() => null);
     if (member) {
       await guild.members.ban(userId, {
-        reason: `Auto-ban: 3 warns. Last reason: ${reason || "No reason"}`,
+        reason: `Auto-ban: ${threshold} warns. Last reason: ${reason || "No reason"}`,
       });
-      await logToAppLogs(guild, `🔨 Auto-banned <@${userId}> (3 warns).`);
+      await logToAppLogs(guild, `🔨 Auto-banned <@${userId}> (${threshold} warns).`);
     } else {
       await guild.members.ban(userId, {
-        reason: `Auto-ban: 3 warns (member not cached). Last reason: ${reason || "No reason"}`,
+        reason: `Auto-ban: ${threshold} warns (member not cached). Last reason: ${reason || "No reason"}`,
       });
-      await logToAppLogs(guild, `🔨 Auto-banned <@${userId}> (3 warns).`);
+      await logToAppLogs(guild, `🔨 Auto-banned <@${userId}> (${threshold} warns).`);
     }
   }
 
@@ -478,12 +590,13 @@ async function addAdWarn(guild, userId, reason, source = "anti_advertise") {
     `🚫 Ad-warn: <@${userId}> (ad_warns=${adWarns}/3) | source=${source} | ${reason || "No reason"}`
   );
 
-  // 3 ad-warns => permanent mute
-  if (adWarns >= 3) {
+  // ad-warns => permanent mute at configured threshold
+  const threshold = Number(getGuildSettings(guild.id).adwarn_mute_threshold ?? 3);
+  if (adWarns >= threshold) {
     const member = await guild.members.fetch(userId).catch(() => null);
     if (member) {
-      await applyPermanentMute(member, `Permanent mute: 3 ad-warns. Last reason: ${reason || "No reason"}`);
-      await logToAppLogs(guild, `🔇 Permanently muted <@${userId}> (3 ad-warns).`);
+      await applyPermanentMute(member, `Permanent mute: ${threshold} ad-warns. Last reason: ${reason || "No reason"}`);
+      await logToAppLogs(guild, `🔇 Permanently muted <@${userId}> (${threshold} ad-warns).`);
     }
   }
 
@@ -561,6 +674,91 @@ const commands = [
             .setRequired(true)
             .addChannelTypes(ChannelType.GuildCategory)
         )
+    )
+    .addSubcommand((sc) =>
+      sc
+        .setName("automod_links")
+        .setDescription("Configure link/advertise automod")
+        .addBooleanOption((o) =>
+          o.setName("enabled").setDescription("Enable link detection").setRequired(true)
+        )
+        .addStringOption((o) =>
+          o
+            .setName("action")
+            .setDescription("What to do when links are posted")
+            .setRequired(true)
+            .addChoices(
+              { name: "ad-warn (default)", value: "adwarn" },
+              { name: "warn", value: "warn" }
+            )
+        )
+        .addBooleanOption((o) =>
+          o
+            .setName("delete")
+            .setDescription("Delete link messages")
+            .setRequired(true)
+        )
+    )
+    .addSubcommand((sc) =>
+      sc
+        .setName("automod_caps")
+        .setDescription("Configure caps automod")
+        .addBooleanOption((o) =>
+          o.setName("enabled").setDescription("Enable caps detection").setRequired(true)
+        )
+        .addNumberOption((o) =>
+          o
+            .setName("ratio")
+            .setDescription("Caps ratio threshold (0.50 - 1.00)")
+            .setRequired(true)
+            .setMinValue(0.5)
+            .setMaxValue(1.0)
+        )
+        .addIntegerOption((o) =>
+          o
+            .setName("min_letters")
+            .setDescription("Minimum letters to trigger (e.g. 8)")
+            .setRequired(true)
+            .setMinValue(4)
+            .setMaxValue(50)
+        )
+        .addIntegerOption((o) =>
+          o
+            .setName("min_len")
+            .setDescription("Minimum message length to trigger (e.g. 12)")
+            .setRequired(true)
+            .setMinValue(6)
+            .setMaxValue(200)
+        )
+        .addIntegerOption((o) =>
+          o
+            .setName("cooldown_seconds")
+            .setDescription("Cooldown per user between caps punishments")
+            .setRequired(true)
+            .setMinValue(5)
+            .setMaxValue(600)
+        )
+    )
+    .addSubcommand((sc) =>
+      sc
+        .setName("punishments")
+        .setDescription("Configure warning thresholds")
+        .addIntegerOption((o) =>
+          o
+            .setName("autoban_warns")
+            .setDescription("Warns needed for auto-ban")
+            .setRequired(true)
+            .setMinValue(1)
+            .setMaxValue(20)
+        )
+        .addIntegerOption((o) =>
+          o
+            .setName("adwarns_to_mute")
+            .setDescription("Ad-warns needed for permanent mute")
+            .setRequired(true)
+            .setMinValue(1)
+            .setMaxValue(20)
+        )
     ),
   new SlashCommandBuilder()
     .setName("warn")
@@ -601,6 +799,182 @@ const commands = [
   new SlashCommandBuilder()
     .setName("config")
     .setDescription("Show current config (staff only)"),
+
+  // --- Staff utility commands ---
+  new SlashCommandBuilder()
+    .setName("ban")
+    .setDescription("Ban a user (staff only)")
+    .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+    .addStringOption((o) => o.setName("reason").setDescription("Reason").setRequired(false))
+    .addIntegerOption((o) =>
+      o
+        .setName("delete_days")
+        .setDescription("Delete message history (0-7 days)")
+        .setRequired(false)
+        .setMinValue(0)
+        .setMaxValue(7)
+    ),
+  new SlashCommandBuilder()
+    .setName("unban")
+    .setDescription("Unban a user by ID (staff only)")
+    .addStringOption((o) =>
+      o.setName("user_id").setDescription("User ID").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("kick")
+    .setDescription("Kick a user (staff only)")
+    .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+    .addStringOption((o) => o.setName("reason").setDescription("Reason").setRequired(false)),
+  new SlashCommandBuilder()
+    .setName("timeout")
+    .setDescription("Timeout a user (staff only)")
+    .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+    .addIntegerOption((o) =>
+      o
+        .setName("minutes")
+        .setDescription("Minutes (1-10080)")
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(10080)
+    )
+    .addStringOption((o) => o.setName("reason").setDescription("Reason").setRequired(false)),
+  new SlashCommandBuilder()
+    .setName("untimeout")
+    .setDescription("Remove timeout from a user (staff only)")
+    .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("purge")
+    .setDescription("Delete recent messages (staff only)")
+    .addIntegerOption((o) =>
+      o
+        .setName("amount")
+        .setDescription("How many (1-100)")
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(100)
+    )
+    .addUserOption((o) =>
+      o.setName("user").setDescription("Only delete from this user").setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("slowmode")
+    .setDescription("Set channel slowmode (staff only)")
+    .addIntegerOption((o) =>
+      o
+        .setName("seconds")
+        .setDescription("Seconds (0-21600)")
+        .setRequired(true)
+        .setMinValue(0)
+        .setMaxValue(21600)
+    ),
+  new SlashCommandBuilder().setName("lock").setDescription("Lock the current channel (staff only)"),
+  new SlashCommandBuilder().setName("unlock").setDescription("Unlock the current channel (staff only)"),
+  new SlashCommandBuilder()
+    .setName("announce")
+    .setDescription("Send an announcement embed (staff only)")
+    .addChannelOption((o) =>
+      o
+        .setName("channel")
+        .setDescription("Target channel")
+        .setRequired(true)
+        .addChannelTypes(ChannelType.GuildText)
+    )
+    .addStringOption((o) =>
+      o.setName("title").setDescription("Title").setRequired(true).setMaxLength(256)
+    )
+    .addStringOption((o) =>
+      o.setName("message").setDescription("Message").setRequired(true).setMaxLength(4000)
+    ),
+  new SlashCommandBuilder()
+    .setName("say")
+    .setDescription("Make the bot send a message (staff only)")
+    .addChannelOption((o) =>
+      o
+        .setName("channel")
+        .setDescription("Target channel")
+        .setRequired(true)
+        .addChannelTypes(ChannelType.GuildText)
+    )
+    .addStringOption((o) =>
+      o.setName("message").setDescription("Message").setRequired(true).setMaxLength(2000)
+    ),
+  new SlashCommandBuilder()
+    .setName("addrole")
+    .setDescription("Add a role to a user (staff only)")
+    .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+    .addRoleOption((o) => o.setName("role").setDescription("Role").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("removerole")
+    .setDescription("Remove a role from a user (staff only)")
+    .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+    .addRoleOption((o) => o.setName("role").setDescription("Role").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("nick")
+    .setDescription("Change a user's nickname (staff only)")
+    .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+    .addStringOption((o) =>
+      o.setName("nickname").setDescription("New nickname (empty clears)").setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("infractions")
+    .setDescription("View or reset a user's infractions (staff only)")
+    .addSubcommand((sc) =>
+      sc
+        .setName("view")
+        .setDescription("View warns/ad-warns")
+        .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+    )
+    .addSubcommand((sc) =>
+      sc
+        .setName("reset")
+        .setDescription("Reset warns/ad-warns")
+        .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+    )
+    .addSubcommand((sc) =>
+      sc
+        .setName("pardon")
+        .setDescription("Remove N warns")
+        .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+        .addIntegerOption((o) =>
+          o.setName("amount").setDescription("Amount").setRequired(true).setMinValue(1).setMaxValue(20)
+        )
+    )
+    .addSubcommand((sc) =>
+      sc
+        .setName("pardon_ad")
+        .setDescription("Remove N ad-warns")
+        .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+        .addIntegerOption((o) =>
+          o.setName("amount").setDescription("Amount").setRequired(true).setMinValue(1).setMaxValue(20)
+        )
+    ),
+  new SlashCommandBuilder()
+    .setName("note")
+    .setDescription("Staff notes for a user (staff only)")
+    .addSubcommand((sc) =>
+      sc
+        .setName("add")
+        .setDescription("Add a note")
+        .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+        .addStringOption((o) =>
+          o.setName("text").setDescription("Note text").setRequired(true).setMaxLength(1000)
+        )
+    )
+    .addSubcommand((sc) =>
+      sc
+        .setName("list")
+        .setDescription("List last notes")
+        .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+        .addIntegerOption((o) =>
+          o.setName("limit").setDescription("How many (1-10)").setRequired(false).setMinValue(1).setMaxValue(10)
+        )
+    )
+    .addSubcommand((sc) =>
+      sc
+        .setName("clear")
+        .setDescription("Clear notes")
+        .addUserOption((o) => o.setName("user").setDescription("User").setRequired(true))
+    ),
 ].map((c) => c.toJSON());
 
 async function registerCommands() {
@@ -648,9 +1022,10 @@ function looksLikeLink(content) {
 
 function isMostlyCaps(content) {
   const letters = content.replace(/[^a-zA-Z]/g, "");
-  if (letters.length < 8) return false;
+  // Caller applies thresholds.
+  if (letters.length < 1) return false;
   const upper = letters.replace(/[^A-Z]/g, "").length;
-  return upper / letters.length >= 0.75 && content.length >= 12;
+  return upper / letters.length;
 }
 
 client.on(Events.MessageCreate, async (message) => {
@@ -663,27 +1038,62 @@ client.on(Events.MessageCreate, async (message) => {
     if (!member) return;
     if (isStaff(member)) return;
 
+    const settings = getGuildSettings(message.guild.id);
+
     // Anti-advertise
-    if (looksLikeLink(message.content)) {
-      await message.delete().catch(() => null);
-      const adWarns = await addAdWarn(
-        message.guild,
-        message.author.id,
-        "Posting links / advertising is not allowed.",
-        "anti_advertise"
-      );
-      const reply = await message.channel
-        .send(`🚫 <@${message.author.id}> links are not allowed here. (ad-warns: ${adWarns}/3)`)
-        .catch(() => null);
-      if (reply) setTimeout(() => reply.delete().catch(() => null), 8000);
+    if (Number(settings.automod_link_enabled ?? 1) === 1 && looksLikeLink(message.content)) {
+      if (Number(settings.automod_link_delete ?? 1) === 1) {
+        await message.delete().catch(() => null);
+      }
+
+      const action = String(settings.automod_link_action ?? "adwarn");
+      if (action === "warn") {
+        const warns = await addWarn(
+          message.guild,
+          message.author.id,
+          "Posting links / advertising is not allowed.",
+          "anti_advertise"
+        );
+        const threshold = Number(getGuildSettings(message.guild.id).autoban_warn_threshold ?? 3);
+        const reply = await message.channel
+          .send(`🚫 <@${message.author.id}> links are not allowed here. (warns: ${warns}/${threshold})`)
+          .catch(() => null);
+        if (reply) setTimeout(() => reply.delete().catch(() => null), 8000);
+      } else {
+        const adWarns = await addAdWarn(
+          message.guild,
+          message.author.id,
+          "Posting links / advertising is not allowed.",
+          "anti_advertise"
+        );
+        const th = Number(getGuildSettings(message.guild.id).adwarn_mute_threshold ?? 3);
+        const reply = await message.channel
+          .send(`🚫 <@${message.author.id}> links are not allowed here. (ad-warns: ${adWarns}/${th})`)
+          .catch(() => null);
+        if (reply) setTimeout(() => reply.delete().catch(() => null), 8000);
+      }
       return;
     }
 
     // Caps spam automod
-    if (isMostlyCaps(message.content)) {
+    if (Number(settings.automod_caps_enabled ?? 1) === 1) {
+      const ratio = Number(settings.automod_caps_ratio ?? 0.75);
+      const minLetters = Number(settings.automod_caps_min_letters ?? 8);
+      const minLen = Number(settings.automod_caps_min_len ?? 12);
+      const cooldownMs = Number(settings.automod_caps_cooldown_ms ?? 30000);
+
+      const lettersOnly = message.content.replace(/[^a-zA-Z]/g, "");
+      const capsRatio = isMostlyCaps(message.content);
+      const shouldTrigger =
+        lettersOnly.length >= minLetters &&
+        message.content.length >= minLen &&
+        capsRatio >= ratio;
+
+      if (!shouldTrigger) return;
+
       const key = `${message.guild.id}:${message.author.id}`;
       const last = capsWarnCooldown.get(key) ?? 0;
-      if (now() - last < 30_000) {
+      if (now() - last < cooldownMs) {
         // Still delete, but avoid warning spam.
         await message.delete().catch(() => null);
         return;
@@ -696,8 +1106,9 @@ client.on(Events.MessageCreate, async (message) => {
         "Caps spam / excessive caps.",
         "caps_automod"
       );
+      const threshold = Number(getGuildSettings(message.guild.id).autoban_warn_threshold ?? 3);
       const reply = await message.channel
-        .send(`⚠️ <@${message.author.id}> please avoid caps spam. (warns: ${warns}/3)`)
+        .send(`⚠️ <@${message.author.id}> please avoid caps spam. (warns: ${warns}/${threshold})`)
         .catch(() => null);
       if (reply) setTimeout(() => reply.delete().catch(() => null), 8000);
     }
@@ -1000,6 +1411,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
+    // --- Staff gate for staff utility commands ---
+    const staffOnlyCommands = new Set([
+      "set",
+      "config",
+      "warn",
+      "warnings",
+      "clearwarns",
+      "mute",
+      "unmute",
+      "ban",
+      "unban",
+      "kick",
+      "timeout",
+      "untimeout",
+      "purge",
+      "slowmode",
+      "lock",
+      "unlock",
+      "announce",
+      "say",
+      "addrole",
+      "removerole",
+      "nick",
+      "infractions",
+      "note",
+    ]);
+    if (staffOnlyCommands.has(interaction.commandName) && !isStaff(interaction.member)) {
+      return safeReply(interaction, { content: "❌ Staff only.", ephemeral: true });
+    }
+
     // /ping
     if (interaction.commandName === "ping") {
       return safeReply(interaction, "🏓 Pong!");
@@ -1076,13 +1517,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // /set ... (staff only)
     if (interaction.commandName === "set") {
-      if (!isStaff(interaction.member)) {
-        return safeReply(interaction, {
-          content: "❌ Staff only.",
-          ephemeral: true,
-        });
-      }
-
       const sub = interaction.options.getSubcommand();
       const guild = interaction.guild;
 
@@ -1134,13 +1568,70 @@ client.on(Events.InteractionCreate, async (interaction) => {
           ephemeral: true,
         });
       }
+
+      if (sub === "automod_links") {
+        const enabled = interaction.options.getBoolean("enabled", true);
+        const action = interaction.options.getString("action", true);
+        const del = interaction.options.getBoolean("delete", true);
+        const next = saveGuildSettings(guild.id, {
+          automod_link_enabled: enabled ? 1 : 0,
+          automod_link_action: action,
+          automod_link_delete: del ? 1 : 0,
+        });
+        return safeReply(interaction, {
+          content:
+            `✅ Link automod saved.\n` +
+            `Enabled: ${next.automod_link_enabled ? "Yes" : "No"}\n` +
+            `Action: ${next.automod_link_action}\n` +
+            `Delete: ${next.automod_link_delete ? "Yes" : "No"}`,
+          ephemeral: true,
+        });
+      }
+
+      if (sub === "automod_caps") {
+        const enabled = interaction.options.getBoolean("enabled", true);
+        const ratio = interaction.options.getNumber("ratio", true);
+        const minLetters = interaction.options.getInteger("min_letters", true);
+        const minLen = interaction.options.getInteger("min_len", true);
+        const cooldownSeconds = interaction.options.getInteger("cooldown_seconds", true);
+        const next = saveGuildSettings(guild.id, {
+          automod_caps_enabled: enabled ? 1 : 0,
+          automod_caps_ratio: ratio,
+          automod_caps_min_letters: minLetters,
+          automod_caps_min_len: minLen,
+          automod_caps_cooldown_ms: cooldownSeconds * 1000,
+        });
+        return safeReply(interaction, {
+          content:
+            `✅ Caps automod saved.\n` +
+            `Enabled: ${next.automod_caps_enabled ? "Yes" : "No"}\n` +
+            `Ratio: ${next.automod_caps_ratio}\n` +
+            `Min letters: ${next.automod_caps_min_letters}\n` +
+            `Min length: ${next.automod_caps_min_len}\n` +
+            `Cooldown: ${Math.round(next.automod_caps_cooldown_ms / 1000)}s`,
+          ephemeral: true,
+        });
+      }
+
+      if (sub === "punishments") {
+        const autobanWarns = interaction.options.getInteger("autoban_warns", true);
+        const adWarnsToMute = interaction.options.getInteger("adwarns_to_mute", true);
+        const next = saveGuildSettings(guild.id, {
+          autoban_warn_threshold: autobanWarns,
+          adwarn_mute_threshold: adWarnsToMute,
+        });
+        return safeReply(interaction, {
+          content:
+            `✅ Punishment thresholds saved.\n` +
+            `Auto-ban warns: ${next.autoban_warn_threshold}\n` +
+            `Permanent mute ad-warns: ${next.adwarn_mute_threshold}`,
+          ephemeral: true,
+        });
+      }
     }
 
     // /config (staff only)
     if (interaction.commandName === "config") {
-      if (!isStaff(interaction.member)) {
-        return safeReply(interaction, { content: "❌ Staff only.", ephemeral: true });
-      }
       const s = getGuildSettings(interaction.guild.id);
       const embed = new EmbedBuilder()
         .setTitle("⚙️ Bot Config")
@@ -1167,6 +1658,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
               `Category: ${s.applogs_category_id ? `<#${s.applogs_category_id}>` : "(not set)"}`,
               `Logs channel: ${s.applogs_channel_id ? `<#${s.applogs_channel_id}>` : "(not set)"}`,
             ].join("\n"),
+          },
+          {
+            name: "Automod",
+            value: [
+              `Links: ${s.automod_link_enabled ? "On" : "Off"} (action=${s.automod_link_action}, delete=${s.automod_link_delete ? "Yes" : "No"})`,
+              `Caps: ${s.automod_caps_enabled ? "On" : "Off"} (ratio=${s.automod_caps_ratio}, minLetters=${s.automod_caps_min_letters}, minLen=${s.automod_caps_min_len}, cooldown=${Math.round((s.automod_caps_cooldown_ms ?? 30000) / 1000)}s)`,
+              `Auto-ban warns: ${s.autoban_warn_threshold ?? 3}`,
+              `Permanent mute ad-warns: ${s.adwarn_mute_threshold ?? 3}`,
+            ].join("\n"),
           }
         );
       return safeReply(interaction, { embeds: [embed], ephemeral: true });
@@ -1188,22 +1688,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // /warnings (staff only)
     if (interaction.commandName === "warnings") {
-      if (!isStaff(interaction.member)) {
-        return safeReply(interaction, { content: "❌ Staff only.", ephemeral: true });
-      }
       const user = interaction.options.getUser("user", true);
       const p = getPunishment(interaction.guild.id, user.id);
+      const s = getGuildSettings(interaction.guild.id);
       return safeReply(interaction, {
-        content: `Warnings for <@${user.id}>:\n- warns: ${p.warns ?? 0}/3\n- ad-warns: ${p.ad_warns ?? 0}/3`,
+        content:
+          `Infractions for <@${user.id}>:\n` +
+          `- warns: ${p.warns ?? 0}/${s.autoban_warn_threshold ?? 3}\n` +
+          `- ad-warns: ${p.ad_warns ?? 0}/${s.adwarn_mute_threshold ?? 3}`,
         ephemeral: true,
       });
     }
 
     // /clearwarns (staff only)
     if (interaction.commandName === "clearwarns") {
-      if (!isStaff(interaction.member)) {
-        return safeReply(interaction, { content: "❌ Staff only.", ephemeral: true });
-      }
       const user = interaction.options.getUser("user", true);
       clearPunishment(interaction.guild.id, user.id);
       await logToAppLogs(interaction.guild, `🧽 Cleared warnings for <@${user.id}> by <@${interaction.user.id}>.`);
@@ -1215,9 +1713,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // /mute (staff only)
     if (interaction.commandName === "mute") {
-      if (!isStaff(interaction.member)) {
-        return safeReply(interaction, { content: "❌ Staff only.", ephemeral: true });
-      }
       const user = interaction.options.getUser("user", true);
       const reason = interaction.options.getString("reason") || "No reason";
       const member = await interaction.guild.members.fetch(user.id).catch(() => null);
@@ -1231,9 +1726,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // /unmute (staff only)
     if (interaction.commandName === "unmute") {
-      if (!isStaff(interaction.member)) {
-        return safeReply(interaction, { content: "❌ Staff only.", ephemeral: true });
-      }
       const user = interaction.options.getUser("user", true);
       const member = await interaction.guild.members.fetch(user.id).catch(() => null);
       if (!member) {
@@ -1245,6 +1737,241 @@ client.on(Events.InteractionCreate, async (interaction) => {
         content: `✅ Unmuted <@${user.id}>. Restored roles: ${res.restored}`,
         ephemeral: true,
       });
+    }
+
+    // --- New staff utility commands ---
+    if (interaction.commandName === "ban") {
+      const user = interaction.options.getUser("user", true);
+      const reason = interaction.options.getString("reason") || "No reason";
+      const deleteDays = interaction.options.getInteger("delete_days") ?? 0;
+      await interaction.guild.members.ban(user.id, {
+        reason: `Ban by ${interaction.user.tag}: ${reason}`,
+        deleteMessageSeconds: deleteDays * 86400,
+      });
+      await logToAppLogs(interaction.guild, `🔨 Banned <@${user.id}> by <@${interaction.user.id}> | ${reason}`);
+      return safeReply(interaction, { content: `✅ Banned <@${user.id}>.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "unban") {
+      const userId = interaction.options.getString("user_id", true);
+      await interaction.guild.bans.remove(userId, `Unban by ${interaction.user.tag}`).catch((e) => {
+        throw e;
+      });
+      await logToAppLogs(interaction.guild, `✅ Unbanned <@${userId}> by <@${interaction.user.id}>.`);
+      return safeReply(interaction, { content: `✅ Unbanned \`${userId}\`.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "kick") {
+      const user = interaction.options.getUser("user", true);
+      const reason = interaction.options.getString("reason") || "No reason";
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      if (!member) return safeReply(interaction, { content: "❌ User not found in guild.", ephemeral: true });
+      await member.kick(`Kick by ${interaction.user.tag}: ${reason}`);
+      await logToAppLogs(interaction.guild, `👢 Kicked <@${user.id}> by <@${interaction.user.id}> | ${reason}`);
+      return safeReply(interaction, { content: `✅ Kicked <@${user.id}>.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "timeout") {
+      const user = interaction.options.getUser("user", true);
+      const minutes = interaction.options.getInteger("minutes", true);
+      const reason = interaction.options.getString("reason") || "No reason";
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      if (!member) return safeReply(interaction, { content: "❌ User not found in guild.", ephemeral: true });
+      await member.timeout(minutes * 60_000, `Timeout by ${interaction.user.tag}: ${reason}`);
+      await logToAppLogs(interaction.guild, `⏳ Timed out <@${user.id}> for ${minutes}m by <@${interaction.user.id}> | ${reason}`);
+      return safeReply(interaction, { content: `✅ Timed out <@${user.id}> for ${minutes} minutes.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "untimeout") {
+      const user = interaction.options.getUser("user", true);
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      if (!member) return safeReply(interaction, { content: "❌ User not found in guild.", ephemeral: true });
+      await member.timeout(null, `Timeout removed by ${interaction.user.tag}`);
+      await logToAppLogs(interaction.guild, `✅ Removed timeout for <@${user.id}> by <@${interaction.user.id}>.`);
+      return safeReply(interaction, { content: `✅ Removed timeout for <@${user.id}>.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "purge") {
+      const amount = interaction.options.getInteger("amount", true);
+      const user = interaction.options.getUser("user");
+      const channel = interaction.channel;
+      if (!channel || !("messages" in channel)) {
+        return safeReply(interaction, { content: "❌ This command must be used in a text channel.", ephemeral: true });
+      }
+      await interaction.deferReply({ ephemeral: true });
+      const fetched = await channel.messages.fetch({ limit: amount }).catch(() => null);
+      if (!fetched) return safeReply(interaction, { content: "❌ Could not fetch messages.", ephemeral: true });
+      const toDelete = user ? fetched.filter((m) => m.author.id === user.id) : fetched;
+      const deleted = await channel.bulkDelete(toDelete, true).catch(() => null);
+      const count = deleted ? deleted.size : 0;
+      await logToAppLogs(interaction.guild, `🧹 Purged ${count} messages in <#${channel.id}> by <@${interaction.user.id}>.`);
+      return safeReply(interaction, { content: `✅ Deleted ${count} messages.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "slowmode") {
+      const seconds = interaction.options.getInteger("seconds", true);
+      const channel = interaction.channel;
+      if (!channel || !("setRateLimitPerUser" in channel)) {
+        return safeReply(interaction, { content: "❌ Use this in a text channel.", ephemeral: true });
+      }
+      await channel.setRateLimitPerUser(seconds, `Slowmode set by ${interaction.user.tag}`);
+      await logToAppLogs(interaction.guild, `🐢 Set slowmode ${seconds}s in <#${channel.id}> by <@${interaction.user.id}>.`);
+      return safeReply(interaction, { content: `✅ Slowmode set to ${seconds}s.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "lock") {
+      const channel = interaction.channel;
+      if (!channel || !("permissionOverwrites" in channel)) {
+        return safeReply(interaction, { content: "❌ Use this in a guild channel.", ephemeral: true });
+      }
+      if (stmtIsLocked.get(interaction.guild.id, channel.id)) {
+        return safeReply(interaction, { content: "ℹ️ Channel is already locked.", ephemeral: true });
+      }
+      await channel.permissionOverwrites.edit(
+        interaction.guild.id,
+        { SendMessages: false, AddReactions: false },
+        { reason: `Lock by ${interaction.user.tag}` }
+      );
+      stmtLockChannel.run(interaction.guild.id, channel.id, Date.now());
+      await logToAppLogs(interaction.guild, `🔒 Locked <#${channel.id}> by <@${interaction.user.id}>.`);
+      return safeReply(interaction, { content: "✅ Channel locked.", ephemeral: true });
+    }
+
+    if (interaction.commandName === "unlock") {
+      const channel = interaction.channel;
+      if (!channel || !("permissionOverwrites" in channel)) {
+        return safeReply(interaction, { content: "❌ Use this in a guild channel.", ephemeral: true });
+      }
+      await channel.permissionOverwrites.edit(
+        interaction.guild.id,
+        { SendMessages: null, AddReactions: null },
+        { reason: `Unlock by ${interaction.user.tag}` }
+      );
+      stmtUnlockChannel.run(interaction.guild.id, channel.id);
+      await logToAppLogs(interaction.guild, `🔓 Unlocked <#${channel.id}> by <@${interaction.user.id}>.`);
+      return safeReply(interaction, { content: "✅ Channel unlocked.", ephemeral: true });
+    }
+
+    if (interaction.commandName === "announce") {
+      const channel = interaction.options.getChannel("channel", true);
+      const title = interaction.options.getString("title", true);
+      const msg = interaction.options.getString("message", true);
+      const embed = new EmbedBuilder().setTitle(title).setDescription(msg).setColor(0xf1c40f).setTimestamp();
+      await channel.send({ embeds: [embed] });
+      await logToAppLogs(interaction.guild, `📣 Announcement sent in <#${channel.id}> by <@${interaction.user.id}>.`);
+      return safeReply(interaction, { content: `✅ Sent announcement in ${channel}.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "say") {
+      const channel = interaction.options.getChannel("channel", true);
+      const msg = interaction.options.getString("message", true);
+      await channel.send({ content: msg, allowedMentions: { parse: [] } });
+      return safeReply(interaction, { content: `✅ Sent message in ${channel}.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "addrole") {
+      const user = interaction.options.getUser("user", true);
+      const role = interaction.options.getRole("role", true);
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      if (!member) return safeReply(interaction, { content: "❌ User not found in guild.", ephemeral: true });
+      await member.roles.add(role.id, `Role add by ${interaction.user.tag}`);
+      await logToAppLogs(interaction.guild, `➕ Added role <@&${role.id}> to <@${user.id}> by <@${interaction.user.id}>.`);
+      return safeReply(interaction, { content: `✅ Added <@&${role.id}> to <@${user.id}>.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "removerole") {
+      const user = interaction.options.getUser("user", true);
+      const role = interaction.options.getRole("role", true);
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      if (!member) return safeReply(interaction, { content: "❌ User not found in guild.", ephemeral: true });
+      await member.roles.remove(role.id, `Role remove by ${interaction.user.tag}`);
+      await logToAppLogs(interaction.guild, `➖ Removed role <@&${role.id}> from <@${user.id}> by <@${interaction.user.id}>.`);
+      return safeReply(interaction, { content: `✅ Removed <@&${role.id}> from <@${user.id}>.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === "nick") {
+      const user = interaction.options.getUser("user", true);
+      const nickname = interaction.options.getString("nickname") ?? null;
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      if (!member) return safeReply(interaction, { content: "❌ User not found in guild.", ephemeral: true });
+      await member.setNickname(nickname, `Nickname set by ${interaction.user.tag}`);
+      await logToAppLogs(interaction.guild, `🏷️ Nickname changed for <@${user.id}> by <@${interaction.user.id}>.`);
+      return safeReply(interaction, { content: "✅ Nickname updated.", ephemeral: true });
+    }
+
+    if (interaction.commandName === "infractions") {
+      const sub = interaction.options.getSubcommand();
+      const user = interaction.options.getUser("user", true);
+      const p = getPunishment(interaction.guild.id, user.id);
+      const s = getGuildSettings(interaction.guild.id);
+
+      if (sub === "view") {
+        const embed = new EmbedBuilder()
+          .setTitle("📋 Infractions")
+          .setColor(0x95a5a6)
+          .setDescription(
+            [
+              `User: <@${user.id}>`,
+              `Warns: ${p.warns ?? 0}/${s.autoban_warn_threshold ?? 3}`,
+              `Ad-warns: ${p.ad_warns ?? 0}/${s.adwarn_mute_threshold ?? 3}`,
+            ].join("\n")
+          );
+        return safeReply(interaction, { embeds: [embed], ephemeral: true });
+      }
+
+      if (sub === "reset") {
+        clearPunishment(interaction.guild.id, user.id);
+        await logToAppLogs(interaction.guild, `🧽 Reset infractions for <@${user.id}> by <@${interaction.user.id}>.`);
+        return safeReply(interaction, { content: `✅ Reset infractions for <@${user.id}>.`, ephemeral: true });
+      }
+
+      if (sub === "pardon") {
+        const amount = interaction.options.getInteger("amount", true);
+        const nextWarns = Math.max(0, (p.warns ?? 0) - amount);
+        setPunishment(interaction.guild.id, user.id, nextWarns, p.ad_warns ?? 0);
+        await logToAppLogs(interaction.guild, `✅ Pardoned ${amount} warns for <@${user.id}> by <@${interaction.user.id}>.`);
+        return safeReply(interaction, { content: `✅ Removed ${amount} warns. Now: ${nextWarns}.`, ephemeral: true });
+      }
+
+      if (sub === "pardon_ad") {
+        const amount = interaction.options.getInteger("amount", true);
+        const nextAd = Math.max(0, (p.ad_warns ?? 0) - amount);
+        setPunishment(interaction.guild.id, user.id, p.warns ?? 0, nextAd);
+        await logToAppLogs(interaction.guild, `✅ Pardoned ${amount} ad-warns for <@${user.id}> by <@${interaction.user.id}>.`);
+        return safeReply(interaction, { content: `✅ Removed ${amount} ad-warns. Now: ${nextAd}.`, ephemeral: true });
+      }
+    }
+
+    if (interaction.commandName === "note") {
+      const sub = interaction.options.getSubcommand();
+      const user = interaction.options.getUser("user", true);
+
+      if (sub === "add") {
+        const text = interaction.options.getString("text", true);
+        stmtAddNote.run(interaction.guild.id, user.id, text, interaction.user.id, Date.now());
+        await logToAppLogs(interaction.guild, `🗒️ Note added for <@${user.id}> by <@${interaction.user.id}>.`);
+        return safeReply(interaction, { content: "✅ Note added.", ephemeral: true });
+      }
+
+      if (sub === "list") {
+        const limit = interaction.options.getInteger("limit") ?? 5;
+        const rows = stmtGetNotes.all(interaction.guild.id, user.id, limit);
+        const lines = rows.map((r, i) => {
+          const when = new Date(r.created_at).toISOString().replace("T", " ").replace("Z", "");
+          return `**${i + 1}.** ${r.note}\n- by <@${r.staff_id}> at ${when}`;
+        });
+        const embed = new EmbedBuilder()
+          .setTitle("🗒️ Staff Notes")
+          .setColor(0x9b59b6)
+          .setDescription(lines.length ? lines.join("\n\n") : "No notes found.");
+        return safeReply(interaction, { embeds: [embed], ephemeral: true });
+      }
+
+      if (sub === "clear") {
+        stmtClearNotes.run(interaction.guild.id, user.id);
+        await logToAppLogs(interaction.guild, `🗑️ Notes cleared for <@${user.id}> by <@${interaction.user.id}>.`);
+        return safeReply(interaction, { content: "✅ Notes cleared.", ephemeral: true });
+      }
     }
   } catch (err) {
     console.error("❌ Interaction handler error:", err);
