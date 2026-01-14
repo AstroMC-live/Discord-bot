@@ -21,7 +21,8 @@
 
 require("dotenv").config();
 
-const Database = require("better-sqlite3");
+const sqlite3 = require("sqlite3");
+const { open } = require("sqlite");
 
 const {
   ActionRowBuilder,
@@ -62,16 +63,20 @@ if (!BOT_TOKEN) {
   throw new Error("Missing env var BOT_TOKEN. Put it in your .env file.");
 }
 
-// ---- SQLite (single-file persistence) ----
-const db = new Database("bot.sqlite");
-try {
-  db.exec("PRAGMA journal_mode=WAL;");
-  db.exec("PRAGMA foreign_keys=ON;");
-} catch {
-  // Ignore if PRAGMA fails on some platforms.
-}
+// ---- SQLite (persistence) ----
+let db;
+const dbReady = (async () => {
+  db = await open({ filename: "bot.sqlite", driver: sqlite3.Database });
 
-db.exec(`
+  // Best-effort PRAGMA configuration
+  try {
+    await db.exec("PRAGMA journal_mode=WAL;");
+    await db.exec("PRAGMA foreign_keys=ON;");
+  } catch {
+    // ignore
+  }
+
+  await db.exec(`
 CREATE TABLE IF NOT EXISTS guild_settings (
   guild_id TEXT PRIMARY KEY,
   ticket_category_id TEXT,
@@ -93,27 +98,27 @@ CREATE TABLE IF NOT EXISTS guild_settings (
 );
 `);
 
-function ensureColumn(table, columnDef) {
-  try {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef};`);
-  } catch {
-    // Column likely exists already.
+  async function ensureColumn(table, columnDef) {
+    try {
+      await db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef};`);
+    } catch {
+      // Column likely exists already.
+    }
   }
-}
 
-// Backfill columns for older DBs
-ensureColumn("guild_settings", "automod_link_enabled INTEGER NOT NULL DEFAULT 1");
-ensureColumn("guild_settings", "automod_link_action TEXT NOT NULL DEFAULT 'adwarn'");
-ensureColumn("guild_settings", "automod_link_delete INTEGER NOT NULL DEFAULT 1");
-ensureColumn("guild_settings", "automod_caps_enabled INTEGER NOT NULL DEFAULT 1");
-ensureColumn("guild_settings", "automod_caps_ratio REAL NOT NULL DEFAULT 0.75");
-ensureColumn("guild_settings", "automod_caps_min_letters INTEGER NOT NULL DEFAULT 8");
-ensureColumn("guild_settings", "automod_caps_min_len INTEGER NOT NULL DEFAULT 12");
-ensureColumn("guild_settings", "automod_caps_cooldown_ms INTEGER NOT NULL DEFAULT 30000");
-ensureColumn("guild_settings", "autoban_warn_threshold INTEGER NOT NULL DEFAULT 3");
-ensureColumn("guild_settings", "adwarn_mute_threshold INTEGER NOT NULL DEFAULT 3");
+  // Backfill columns for older DBs
+  await ensureColumn("guild_settings", "automod_link_enabled INTEGER NOT NULL DEFAULT 1");
+  await ensureColumn("guild_settings", "automod_link_action TEXT NOT NULL DEFAULT 'adwarn'");
+  await ensureColumn("guild_settings", "automod_link_delete INTEGER NOT NULL DEFAULT 1");
+  await ensureColumn("guild_settings", "automod_caps_enabled INTEGER NOT NULL DEFAULT 1");
+  await ensureColumn("guild_settings", "automod_caps_ratio REAL NOT NULL DEFAULT 0.75");
+  await ensureColumn("guild_settings", "automod_caps_min_letters INTEGER NOT NULL DEFAULT 8");
+  await ensureColumn("guild_settings", "automod_caps_min_len INTEGER NOT NULL DEFAULT 12");
+  await ensureColumn("guild_settings", "automod_caps_cooldown_ms INTEGER NOT NULL DEFAULT 30000");
+  await ensureColumn("guild_settings", "autoban_warn_threshold INTEGER NOT NULL DEFAULT 3");
+  await ensureColumn("guild_settings", "adwarn_mute_threshold INTEGER NOT NULL DEFAULT 3");
 
-db.exec(`
+  await db.exec(`
 CREATE TABLE IF NOT EXISTS user_punishments (
   guild_id TEXT NOT NULL,
   user_id  TEXT NOT NULL,
@@ -123,7 +128,7 @@ CREATE TABLE IF NOT EXISTS user_punishments (
 );
 `);
 
-db.exec(`
+  await db.exec(`
 CREATE TABLE IF NOT EXISTS mute_state (
   guild_id   TEXT NOT NULL,
   user_id    TEXT NOT NULL,
@@ -133,7 +138,7 @@ CREATE TABLE IF NOT EXISTS mute_state (
 );
 `);
 
-db.exec(`
+  await db.exec(`
 CREATE TABLE IF NOT EXISTS channel_locks (
   guild_id TEXT NOT NULL,
   channel_id TEXT NOT NULL,
@@ -142,7 +147,7 @@ CREATE TABLE IF NOT EXISTS channel_locks (
 );
 `);
 
-db.exec(`
+  await db.exec(`
 CREATE TABLE IF NOT EXISTS user_notes (
   guild_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
@@ -151,11 +156,50 @@ CREATE TABLE IF NOT EXISTS user_notes (
   created_at INTEGER NOT NULL
 );
 `);
+})();
 
-const stmtGetSettings = db.prepare(
-  "SELECT * FROM guild_settings WHERE guild_id = ?"
-);
-const stmtUpsertSettings = db.prepare(`
+const settingsCache = new Map(); // guildId -> { ts, value }
+const SETTINGS_TTL_MS = 10_000;
+
+async function getGuildSettings(guildId) {
+  await dbReady;
+  const cached = settingsCache.get(guildId);
+  if (cached && Date.now() - cached.ts < SETTINGS_TTL_MS) return cached.value;
+
+  const row = await db.get("SELECT * FROM guild_settings WHERE guild_id = ?", [
+    guildId,
+  ]);
+  const value =
+    row ?? {
+      guild_id: guildId,
+      ticket_category_id: null,
+      ticket_channel_id: null,
+      application_category_id: null,
+      application_channel_id: null,
+      applogs_category_id: null,
+      applogs_channel_id: null,
+      automod_link_enabled: 1,
+      automod_link_action: "adwarn",
+      automod_link_delete: 1,
+      automod_caps_enabled: 1,
+      automod_caps_ratio: 0.75,
+      automod_caps_min_letters: 8,
+      automod_caps_min_len: 12,
+      automod_caps_cooldown_ms: 30000,
+      autoban_warn_threshold: 3,
+      adwarn_mute_threshold: 3,
+    };
+
+  settingsCache.set(guildId, { ts: Date.now(), value });
+  return value;
+}
+
+async function saveGuildSettings(guildId, patch) {
+  await dbReady;
+  const current = await getGuildSettings(guildId);
+  const next = { ...current, ...patch, guild_id: guildId };
+  await db.run(
+    `
 INSERT INTO guild_settings (
   guild_id,
   ticket_category_id, ticket_channel_id,
@@ -182,127 +226,61 @@ ON CONFLICT(guild_id) DO UPDATE SET
   automod_caps_cooldown_ms=excluded.automod_caps_cooldown_ms,
   autoban_warn_threshold=excluded.autoban_warn_threshold,
   adwarn_mute_threshold=excluded.adwarn_mute_threshold
-`);
-
-const stmtGetPunish = db.prepare(
-  "SELECT warns, ad_warns FROM user_punishments WHERE guild_id = ? AND user_id = ?"
-);
-const stmtUpsertPunish = db.prepare(`
-INSERT INTO user_punishments (guild_id, user_id, warns, ad_warns)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(guild_id, user_id) DO UPDATE SET
-  warns=excluded.warns,
-  ad_warns=excluded.ad_warns
-`);
-const stmtDeletePunish = db.prepare(
-  "DELETE FROM user_punishments WHERE guild_id = ? AND user_id = ?"
-);
-
-const stmtGetMute = db.prepare(
-  "SELECT roles_json, muted_at FROM mute_state WHERE guild_id = ? AND user_id = ?"
-);
-const stmtUpsertMute = db.prepare(`
-INSERT INTO mute_state (guild_id, user_id, roles_json, muted_at)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(guild_id, user_id) DO UPDATE SET
-  roles_json=excluded.roles_json,
-  muted_at=excluded.muted_at
-`);
-const stmtDeleteMute = db.prepare(
-  "DELETE FROM mute_state WHERE guild_id = ? AND user_id = ?"
-);
-
-const stmtLockChannel = db.prepare(
-  "INSERT INTO channel_locks (guild_id, channel_id, locked_at) VALUES (?, ?, ?) ON CONFLICT(guild_id, channel_id) DO UPDATE SET locked_at=excluded.locked_at"
-);
-const stmtUnlockChannel = db.prepare(
-  "DELETE FROM channel_locks WHERE guild_id = ? AND channel_id = ?"
-);
-const stmtIsLocked = db.prepare(
-  "SELECT locked_at FROM channel_locks WHERE guild_id = ? AND channel_id = ?"
-);
-
-const stmtAddNote = db.prepare(
-  "INSERT INTO user_notes (guild_id, user_id, note, staff_id, created_at) VALUES (?, ?, ?, ?, ?)"
-);
-const stmtGetNotes = db.prepare(
-  "SELECT note, staff_id, created_at FROM user_notes WHERE guild_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?"
-);
-const stmtClearNotes = db.prepare(
-  "DELETE FROM user_notes WHERE guild_id = ? AND user_id = ?"
-);
-
-const settingsCache = new Map(); // guildId -> { ts, value }
-const SETTINGS_TTL_MS = 10_000;
-
-function getGuildSettings(guildId) {
-  const cached = settingsCache.get(guildId);
-  if (cached && Date.now() - cached.ts < SETTINGS_TTL_MS) return cached.value;
-
-  const row = stmtGetSettings.get(guildId);
-  const value =
-    row ?? {
-      guild_id: guildId,
-      ticket_category_id: null,
-      ticket_channel_id: null,
-      application_category_id: null,
-      application_channel_id: null,
-      applogs_category_id: null,
-      applogs_channel_id: null,
-      automod_link_enabled: 1,
-      automod_link_action: "adwarn",
-      automod_link_delete: 1,
-      automod_caps_enabled: 1,
-      automod_caps_ratio: 0.75,
-      automod_caps_min_letters: 8,
-      automod_caps_min_len: 12,
-      automod_caps_cooldown_ms: 30000,
-      autoban_warn_threshold: 3,
-      adwarn_mute_threshold: 3,
-    };
-
-  settingsCache.set(guildId, { ts: Date.now(), value });
-  return value;
-}
-
-function saveGuildSettings(guildId, patch) {
-  const current = getGuildSettings(guildId);
-  const next = { ...current, ...patch, guild_id: guildId };
-  stmtUpsertSettings.run(
-    next.guild_id,
-    next.ticket_category_id,
-    next.ticket_channel_id,
-    next.application_category_id,
-    next.application_channel_id,
-    next.applogs_category_id,
-    next.applogs_channel_id,
-    Number(next.automod_link_enabled ?? 1),
-    String(next.automod_link_action ?? "adwarn"),
-    Number(next.automod_link_delete ?? 1),
-    Number(next.automod_caps_enabled ?? 1),
-    Number(next.automod_caps_ratio ?? 0.75),
-    Number(next.automod_caps_min_letters ?? 8),
-    Number(next.automod_caps_min_len ?? 12),
-    Number(next.automod_caps_cooldown_ms ?? 30000),
-    Number(next.autoban_warn_threshold ?? 3),
-    Number(next.adwarn_mute_threshold ?? 3)
+`,
+    [
+      next.guild_id,
+      next.ticket_category_id,
+      next.ticket_channel_id,
+      next.application_category_id,
+      next.application_channel_id,
+      next.applogs_category_id,
+      next.applogs_channel_id,
+      Number(next.automod_link_enabled ?? 1),
+      String(next.automod_link_action ?? "adwarn"),
+      Number(next.automod_link_delete ?? 1),
+      Number(next.automod_caps_enabled ?? 1),
+      Number(next.automod_caps_ratio ?? 0.75),
+      Number(next.automod_caps_min_letters ?? 8),
+      Number(next.automod_caps_min_len ?? 12),
+      Number(next.automod_caps_cooldown_ms ?? 30000),
+      Number(next.autoban_warn_threshold ?? 3),
+      Number(next.adwarn_mute_threshold ?? 3),
+    ]
   );
   settingsCache.set(guildId, { ts: Date.now(), value: next });
   return next;
 }
 
-function getPunishment(guildId, userId) {
-  const row = stmtGetPunish.get(guildId, userId);
+async function getPunishment(guildId, userId) {
+  await dbReady;
+  const row = await db.get(
+    "SELECT warns, ad_warns FROM user_punishments WHERE guild_id = ? AND user_id = ?",
+    [guildId, userId]
+  );
   return row ?? { warns: 0, ad_warns: 0 };
 }
 
-function setPunishment(guildId, userId, warns, adWarns) {
-  stmtUpsertPunish.run(guildId, userId, warns, adWarns);
+async function setPunishment(guildId, userId, warns, adWarns) {
+  await dbReady;
+  await db.run(
+    `
+INSERT INTO user_punishments (guild_id, user_id, warns, ad_warns)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(guild_id, user_id) DO UPDATE SET
+  warns=excluded.warns,
+  ad_warns=excluded.ad_warns
+`,
+    [guildId, userId, warns, adWarns]
+  );
   return { warns, ad_warns: adWarns };
 }
 
-function clearPunishment(guildId, userId) {
-  stmtDeletePunish.run(guildId, userId);
+async function clearPunishment(guildId, userId) {
+  await dbReady;
+  await db.run(
+    "DELETE FROM user_punishments WHERE guild_id = ? AND user_id = ?",
+    [guildId, userId]
+  );
   return { warns: 0, ad_warns: 0 };
 }
 
@@ -391,7 +369,7 @@ async function safeReply(interaction, payload) {
 
 async function logToAppLogs(guild, content, embeds = []) {
   try {
-    const settings = getGuildSettings(guild.id);
+    const settings = await getGuildSettings(guild.id);
     const channelId = settings.applogs_channel_id;
     if (!channelId) return;
     const ch = await guild.channels.fetch(channelId).catch(() => null);
@@ -423,7 +401,7 @@ async function sendApplyPanelToChannel(channel) {
 }
 
 async function createTicketForUser(guild, user) {
-  const settings = getGuildSettings(guild.id);
+  const settings = await getGuildSettings(guild.id);
   const ticketCategoryId = settings.ticket_category_id || TICKET_CATEGORY_ID;
 
   // Ensure cache is populated enough to find existing channels reliably.
@@ -495,17 +473,30 @@ async function createTicketForUser(guild, user) {
 }
 
 async function applyPermanentMute(member, reason) {
+  await dbReady;
   const guild = member.guild;
   const mutedRole = guild.roles.cache.get(MUTED_ROLE_ID) ?? (await guild.roles.fetch(MUTED_ROLE_ID).catch(() => null));
   if (!mutedRole) throw new Error("Muted role not found.");
 
   // If already muted, do not overwrite stored roles unless empty.
-  const existing = stmtGetMute.get(guild.id, member.id);
+  const existing = await db.get(
+    "SELECT roles_json, muted_at FROM mute_state WHERE guild_id = ? AND user_id = ?",
+    [guild.id, member.id]
+  );
   if (!existing) {
     const rolesToSave = member.roles.cache
       .filter((r) => r.id !== guild.id && r.id !== MUTED_ROLE_ID && !r.managed)
       .map((r) => r.id);
-    stmtUpsertMute.run(guild.id, member.id, JSON.stringify(rolesToSave), Date.now());
+    await db.run(
+      `
+INSERT INTO mute_state (guild_id, user_id, roles_json, muted_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(guild_id, user_id) DO UPDATE SET
+  roles_json=excluded.roles_json,
+  muted_at=excluded.muted_at
+`,
+      [guild.id, member.id, JSON.stringify(rolesToSave), Date.now()]
+    );
   }
 
   // Remove roles we can remove, then add muted role.
@@ -519,8 +510,12 @@ async function applyPermanentMute(member, reason) {
 }
 
 async function removePermanentMute(member, reason) {
+  await dbReady;
   const guild = member.guild;
-  const row = stmtGetMute.get(guild.id, member.id);
+  const row = await db.get(
+    "SELECT roles_json, muted_at FROM mute_state WHERE guild_id = ? AND user_id = ?",
+    [guild.id, member.id]
+  );
   if (!row) {
     // Still remove muted role if present.
     await member.roles.remove(MUTED_ROLE_ID, reason).catch(() => null);
@@ -544,15 +539,18 @@ async function removePermanentMute(member, reason) {
     await member.roles.add(filtered, reason).catch(() => null);
   }
 
-  stmtDeleteMute.run(guild.id, member.id);
+  await db.run("DELETE FROM mute_state WHERE guild_id = ? AND user_id = ?", [
+    guild.id,
+    member.id,
+  ]);
   return { restored: filtered.length };
 }
 
 async function addWarn(guild, userId, reason, source = "manual") {
-  const p = getPunishment(guild.id, userId);
+  const p = await getPunishment(guild.id, userId);
   const warns = (p.warns ?? 0) + 1;
   const adWarns = p.ad_warns ?? 0;
-  setPunishment(guild.id, userId, warns, adWarns);
+  await setPunishment(guild.id, userId, warns, adWarns);
 
   await logToAppLogs(
     guild,
@@ -560,7 +558,9 @@ async function addWarn(guild, userId, reason, source = "manual") {
   );
 
   // Auto-ban at configured threshold
-  const threshold = Number(getGuildSettings(guild.id).autoban_warn_threshold ?? 3);
+  const threshold = Number(
+    (await getGuildSettings(guild.id)).autoban_warn_threshold ?? 3
+  );
   if (warns >= threshold) {
     const member = await guild.members.fetch(userId).catch(() => null);
     if (member) {
@@ -580,10 +580,10 @@ async function addWarn(guild, userId, reason, source = "manual") {
 }
 
 async function addAdWarn(guild, userId, reason, source = "anti_advertise") {
-  const p = getPunishment(guild.id, userId);
+  const p = await getPunishment(guild.id, userId);
   const warns = p.warns ?? 0;
   const adWarns = (p.ad_warns ?? 0) + 1;
-  setPunishment(guild.id, userId, warns, adWarns);
+  await setPunishment(guild.id, userId, warns, adWarns);
 
   await logToAppLogs(
     guild,
@@ -591,7 +591,9 @@ async function addAdWarn(guild, userId, reason, source = "anti_advertise") {
   );
 
   // ad-warns => permanent mute at configured threshold
-  const threshold = Number(getGuildSettings(guild.id).adwarn_mute_threshold ?? 3);
+  const threshold = Number(
+    (await getGuildSettings(guild.id)).adwarn_mute_threshold ?? 3
+  );
   if (adWarns >= threshold) {
     const member = await guild.members.fetch(userId).catch(() => null);
     if (member) {
@@ -1038,7 +1040,7 @@ client.on(Events.MessageCreate, async (message) => {
     if (!member) return;
     if (isStaff(member)) return;
 
-    const settings = getGuildSettings(message.guild.id);
+    const settings = await getGuildSettings(message.guild.id);
 
     // Anti-advertise
     if (Number(settings.automod_link_enabled ?? 1) === 1 && looksLikeLink(message.content)) {
@@ -1054,7 +1056,9 @@ client.on(Events.MessageCreate, async (message) => {
           "Posting links / advertising is not allowed.",
           "anti_advertise"
         );
-        const threshold = Number(getGuildSettings(message.guild.id).autoban_warn_threshold ?? 3);
+        const threshold = Number(
+          (await getGuildSettings(message.guild.id)).autoban_warn_threshold ?? 3
+        );
         const reply = await message.channel
           .send(`🚫 <@${message.author.id}> links are not allowed here. (warns: ${warns}/${threshold})`)
           .catch(() => null);
@@ -1066,7 +1070,9 @@ client.on(Events.MessageCreate, async (message) => {
           "Posting links / advertising is not allowed.",
           "anti_advertise"
         );
-        const th = Number(getGuildSettings(message.guild.id).adwarn_mute_threshold ?? 3);
+        const th = Number(
+          (await getGuildSettings(message.guild.id)).adwarn_mute_threshold ?? 3
+        );
         const reply = await message.channel
           .send(`🚫 <@${message.author.id}> links are not allowed here. (ad-warns: ${adWarns}/${th})`)
           .catch(() => null);
@@ -1106,7 +1112,9 @@ client.on(Events.MessageCreate, async (message) => {
         "Caps spam / excessive caps.",
         "caps_automod"
       );
-      const threshold = Number(getGuildSettings(message.guild.id).autoban_warn_threshold ?? 3);
+      const threshold = Number(
+        (await getGuildSettings(message.guild.id)).autoban_warn_threshold ?? 3
+      );
       const reply = await message.channel
         .send(`⚠️ <@${message.author.id}> please avoid caps spam. (warns: ${warns}/${threshold})`)
         .catch(() => null);
@@ -1294,7 +1302,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const guild = interaction.guild;
       const user = interaction.user;
-      const settings = getGuildSettings(guild.id);
+      const settings = await getGuildSettings(guild.id);
 
       const appCategoryId = settings.application_category_id;
       if (!appCategoryId) {
@@ -1523,7 +1531,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (sub === "ticket") {
         const category = interaction.options.getChannel("category", true);
         const channel = interaction.options.getChannel("channel", true);
-        const next = saveGuildSettings(guild.id, {
+        const next = await saveGuildSettings(guild.id, {
           ticket_category_id: category.id,
           ticket_channel_id: channel.id,
         });
@@ -1541,7 +1549,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (sub === "application") {
         const category = interaction.options.getChannel("category", true);
         const channel = interaction.options.getChannel("channel", true);
-        const next = saveGuildSettings(guild.id, {
+        const next = await saveGuildSettings(guild.id, {
           application_category_id: category.id,
           application_channel_id: channel.id,
         });
@@ -1559,7 +1567,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (sub === "applogs") {
         const channel = interaction.options.getChannel("channel", true);
         const category = interaction.options.getChannel("category", true);
-        const next = saveGuildSettings(guild.id, {
+        const next = await saveGuildSettings(guild.id, {
           applogs_channel_id: channel.id,
           applogs_category_id: category.id,
         });
@@ -1573,7 +1581,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const enabled = interaction.options.getBoolean("enabled", true);
         const action = interaction.options.getString("action", true);
         const del = interaction.options.getBoolean("delete", true);
-        const next = saveGuildSettings(guild.id, {
+        const next = await saveGuildSettings(guild.id, {
           automod_link_enabled: enabled ? 1 : 0,
           automod_link_action: action,
           automod_link_delete: del ? 1 : 0,
@@ -1594,7 +1602,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const minLetters = interaction.options.getInteger("min_letters", true);
         const minLen = interaction.options.getInteger("min_len", true);
         const cooldownSeconds = interaction.options.getInteger("cooldown_seconds", true);
-        const next = saveGuildSettings(guild.id, {
+        const next = await saveGuildSettings(guild.id, {
           automod_caps_enabled: enabled ? 1 : 0,
           automod_caps_ratio: ratio,
           automod_caps_min_letters: minLetters,
@@ -1616,7 +1624,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (sub === "punishments") {
         const autobanWarns = interaction.options.getInteger("autoban_warns", true);
         const adWarnsToMute = interaction.options.getInteger("adwarns_to_mute", true);
-        const next = saveGuildSettings(guild.id, {
+        const next = await saveGuildSettings(guild.id, {
           autoban_warn_threshold: autobanWarns,
           adwarn_mute_threshold: adWarnsToMute,
         });
@@ -1632,7 +1640,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // /config (staff only)
     if (interaction.commandName === "config") {
-      const s = getGuildSettings(interaction.guild.id);
+      const s = await getGuildSettings(interaction.guild.id);
       const embed = new EmbedBuilder()
         .setTitle("⚙️ Bot Config")
         .setColor(0xf1c40f)
@@ -1689,8 +1697,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // /warnings (staff only)
     if (interaction.commandName === "warnings") {
       const user = interaction.options.getUser("user", true);
-      const p = getPunishment(interaction.guild.id, user.id);
-      const s = getGuildSettings(interaction.guild.id);
+      const p = await getPunishment(interaction.guild.id, user.id);
+      const s = await getGuildSettings(interaction.guild.id);
       return safeReply(interaction, {
         content:
           `Infractions for <@${user.id}>:\n` +
@@ -1703,7 +1711,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // /clearwarns (staff only)
     if (interaction.commandName === "clearwarns") {
       const user = interaction.options.getUser("user", true);
-      clearPunishment(interaction.guild.id, user.id);
+      await clearPunishment(interaction.guild.id, user.id);
       await logToAppLogs(interaction.guild, `🧽 Cleared warnings for <@${user.id}> by <@${interaction.user.id}>.`);
       return safeReply(interaction, {
         content: `✅ Cleared warnings for <@${user.id}>.`,
@@ -1824,7 +1832,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!channel || !("permissionOverwrites" in channel)) {
         return safeReply(interaction, { content: "❌ Use this in a guild channel.", ephemeral: true });
       }
-      if (stmtIsLocked.get(interaction.guild.id, channel.id)) {
+      await dbReady;
+      const lockedRow = await db.get(
+        "SELECT locked_at FROM channel_locks WHERE guild_id = ? AND channel_id = ?",
+        [interaction.guild.id, channel.id]
+      );
+      if (lockedRow) {
         return safeReply(interaction, { content: "ℹ️ Channel is already locked.", ephemeral: true });
       }
       await channel.permissionOverwrites.edit(
@@ -1832,7 +1845,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { SendMessages: false, AddReactions: false },
         { reason: `Lock by ${interaction.user.tag}` }
       );
-      stmtLockChannel.run(interaction.guild.id, channel.id, Date.now());
+      await db.run(
+        "INSERT INTO channel_locks (guild_id, channel_id, locked_at) VALUES (?, ?, ?) ON CONFLICT(guild_id, channel_id) DO UPDATE SET locked_at=excluded.locked_at",
+        [interaction.guild.id, channel.id, Date.now()]
+      );
       await logToAppLogs(interaction.guild, `🔒 Locked <#${channel.id}> by <@${interaction.user.id}>.`);
       return safeReply(interaction, { content: "✅ Channel locked.", ephemeral: true });
     }
@@ -1847,7 +1863,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { SendMessages: null, AddReactions: null },
         { reason: `Unlock by ${interaction.user.tag}` }
       );
-      stmtUnlockChannel.run(interaction.guild.id, channel.id);
+      await dbReady;
+      await db.run("DELETE FROM channel_locks WHERE guild_id = ? AND channel_id = ?", [
+        interaction.guild.id,
+        channel.id,
+      ]);
       await logToAppLogs(interaction.guild, `🔓 Unlocked <#${channel.id}> by <@${interaction.user.id}>.`);
       return safeReply(interaction, { content: "✅ Channel unlocked.", ephemeral: true });
     }
@@ -1902,8 +1922,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === "infractions") {
       const sub = interaction.options.getSubcommand();
       const user = interaction.options.getUser("user", true);
-      const p = getPunishment(interaction.guild.id, user.id);
-      const s = getGuildSettings(interaction.guild.id);
+      const p = await getPunishment(interaction.guild.id, user.id);
+      const s = await getGuildSettings(interaction.guild.id);
 
       if (sub === "view") {
         const embed = new EmbedBuilder()
@@ -1920,7 +1940,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (sub === "reset") {
-        clearPunishment(interaction.guild.id, user.id);
+        await clearPunishment(interaction.guild.id, user.id);
         await logToAppLogs(interaction.guild, `🧽 Reset infractions for <@${user.id}> by <@${interaction.user.id}>.`);
         return safeReply(interaction, { content: `✅ Reset infractions for <@${user.id}>.`, ephemeral: true });
       }
@@ -1928,7 +1948,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (sub === "pardon") {
         const amount = interaction.options.getInteger("amount", true);
         const nextWarns = Math.max(0, (p.warns ?? 0) - amount);
-        setPunishment(interaction.guild.id, user.id, nextWarns, p.ad_warns ?? 0);
+        await setPunishment(interaction.guild.id, user.id, nextWarns, p.ad_warns ?? 0);
         await logToAppLogs(interaction.guild, `✅ Pardoned ${amount} warns for <@${user.id}> by <@${interaction.user.id}>.`);
         return safeReply(interaction, { content: `✅ Removed ${amount} warns. Now: ${nextWarns}.`, ephemeral: true });
       }
@@ -1936,7 +1956,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (sub === "pardon_ad") {
         const amount = interaction.options.getInteger("amount", true);
         const nextAd = Math.max(0, (p.ad_warns ?? 0) - amount);
-        setPunishment(interaction.guild.id, user.id, p.warns ?? 0, nextAd);
+        await setPunishment(interaction.guild.id, user.id, p.warns ?? 0, nextAd);
         await logToAppLogs(interaction.guild, `✅ Pardoned ${amount} ad-warns for <@${user.id}> by <@${interaction.user.id}>.`);
         return safeReply(interaction, { content: `✅ Removed ${amount} ad-warns. Now: ${nextAd}.`, ephemeral: true });
       }
@@ -1948,14 +1968,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (sub === "add") {
         const text = interaction.options.getString("text", true);
-        stmtAddNote.run(interaction.guild.id, user.id, text, interaction.user.id, Date.now());
+        await dbReady;
+        await db.run(
+          "INSERT INTO user_notes (guild_id, user_id, note, staff_id, created_at) VALUES (?, ?, ?, ?, ?)",
+          [interaction.guild.id, user.id, text, interaction.user.id, Date.now()]
+        );
         await logToAppLogs(interaction.guild, `🗒️ Note added for <@${user.id}> by <@${interaction.user.id}>.`);
         return safeReply(interaction, { content: "✅ Note added.", ephemeral: true });
       }
 
       if (sub === "list") {
         const limit = interaction.options.getInteger("limit") ?? 5;
-        const rows = stmtGetNotes.all(interaction.guild.id, user.id, limit);
+        await dbReady;
+        const rows = await db.all(
+          "SELECT note, staff_id, created_at FROM user_notes WHERE guild_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?",
+          [interaction.guild.id, user.id, limit]
+        );
         const lines = rows.map((r, i) => {
           const when = new Date(r.created_at).toISOString().replace("T", " ").replace("Z", "");
           return `**${i + 1}.** ${r.note}\n- by <@${r.staff_id}> at ${when}`;
@@ -1968,7 +1996,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (sub === "clear") {
-        stmtClearNotes.run(interaction.guild.id, user.id);
+        await dbReady;
+        await db.run("DELETE FROM user_notes WHERE guild_id = ? AND user_id = ?", [
+          interaction.guild.id,
+          user.id,
+        ]);
         await logToAppLogs(interaction.guild, `🗑️ Notes cleared for <@${user.id}> by <@${interaction.user.id}>.`);
         return safeReply(interaction, { content: "✅ Notes cleared.", ephemeral: true });
       }
