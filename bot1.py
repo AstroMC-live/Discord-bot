@@ -179,8 +179,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if user:
         try:
             await user.send(
-                "Du kan ikke joine giveaway enda. "
-                f"Du mangler {remaining} ekte meldinger (ingen spam/duplikater)."
+                "You cannot join the giveaway yet. "
+                f"You still need {remaining} valid messages (no spam/duplicates)."
             )
         except discord.HTTPException:
             pass
@@ -221,9 +221,17 @@ async def resolve_channel(channel_id: int) -> discord.TextChannel | None:
     return None
 
 
+def get_message_snapshot(message_id: int, data: dict[str, object]) -> dict[int, int]:
+    if message_id in giveaways:
+        return dict(message_counts.get(message_id, {}))
+    return dict(data.get("message_snapshot", {}))
+
+
 async def end_giveaway(message_id: int, data: dict[str, object]) -> list[int]:
     channel = await resolve_channel(int(data["channel_id"]))
     eligible_ids: list[int] = []
+    winners_ids: list[int] = []
+    message_snapshot = dict(message_counts.get(message_id, {}))
 
     if channel is not None:
         msg = None
@@ -253,6 +261,7 @@ async def end_giveaway(message_id: int, data: dict[str, object]) -> list[int]:
                 winners = random.sample(
                     eligible, min(len(eligible), int(data["winners"]))
                 )
+                winners_ids = [winner.id for winner in winners]
                 await channel.send(
                     f"{GIVEAWAY_EMOJI} Winner(s): "
                     f"{', '.join(w.mention for w in winners)}\n"
@@ -267,6 +276,8 @@ async def end_giveaway(message_id: int, data: dict[str, object]) -> list[int]:
         **data,
         "ended_at": time.time(),
         "eligible_ids": eligible_ids,
+        "winners_ids": winners_ids,
+        "message_snapshot": message_snapshot,
     }
 
     giveaways.pop(message_id, None)
@@ -293,6 +304,8 @@ async def reroll_giveaway(message_id: int, data: dict[str, object]) -> None:
         f"{GIVEAWAY_EMOJI} Reroll winner(s): {mentions}\n"
         f"Prize: {data['prize']}"
     )
+    if message_id in giveaway_archive:
+        giveaway_archive[message_id]["winners_ids"] = winners
 
 
 def prune_archive() -> None:
@@ -314,6 +327,13 @@ class Giveaway(app_commands.Group):
 
     @app_commands.command(name="start", description="Start a giveaway")
     @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe(
+        prize="What you are giving away",
+        duration="How long it runs (e.g., 30m, 2h, 7d)",
+        winners="Number of winners",
+        min_messages="Minimum valid messages to join",
+        activity_channel="Channel where messages count",
+    )
     async def start(
         self,
         interaction: discord.Interaction,
@@ -339,6 +359,11 @@ class Giveaway(app_commands.Group):
         except ValueError:
             await interaction.response.send_message(
                 "Invalid duration. Examples: 30m, 2h, 7d.", ephemeral=True
+            )
+            return
+        if seconds <= 0:
+            await interaction.response.send_message(
+                "Duration must be greater than zero.", ephemeral=True
             )
             return
 
@@ -382,6 +407,7 @@ class Giveaway(app_commands.Group):
 
     @app_commands.command(name="end", description="End a giveaway early")
     @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe(message_id="Giveaway message ID")
     async def end(
         self,
         interaction: discord.Interaction,
@@ -409,6 +435,7 @@ class Giveaway(app_commands.Group):
 
     @app_commands.command(name="reroll", description="Reroll a giveaway")
     @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe(message_id="Giveaway message ID")
     async def reroll(
         self,
         interaction: discord.Interaction,
@@ -435,6 +462,7 @@ class Giveaway(app_commands.Group):
         await reroll_giveaway(mid, data)
 
     @app_commands.command(name="status", description="Show giveaway status")
+    @app_commands.describe(message_id="Giveaway message ID")
     async def status(
         self,
         interaction: discord.Interaction,
@@ -466,6 +494,105 @@ class Giveaway(app_commands.Group):
             f"Your valid messages: {user_count}\n"
             f"Remaining: {remaining}",
             ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="messages",
+        description="Show valid message count for a user",
+    )
+    @app_commands.describe(
+        message_id="Giveaway message ID",
+        user="User to check (default: you)",
+    )
+    async def messages(
+        self,
+        interaction: discord.Interaction,
+        message_id: str,
+        user: discord.Member | None = None,
+    ):
+        try:
+            mid = int(message_id)
+        except ValueError:
+            await interaction.response.send_message(
+                "Invalid message ID.", ephemeral=True
+            )
+            return
+
+        data = giveaways.get(mid) or giveaway_archive.get(mid)
+        if not data:
+            await interaction.response.send_message(
+                "Giveaway not found.", ephemeral=True
+            )
+            return
+
+        target = user or interaction.user
+        counts = get_message_snapshot(mid, data)
+        user_count = int(counts.get(target.id, 0))
+        min_messages = int(data["min_messages"])
+        remaining = max(min_messages - user_count, 0)
+
+        await interaction.response.send_message(
+            f"User: {target.mention}\n"
+            f"Prize: {data['prize']}\n"
+            f"Valid messages: {user_count}\n"
+            f"Required: {min_messages}\n"
+            f"Remaining: {remaining}",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="leaderboard",
+        description="Show winners and top message counts",
+    )
+    @app_commands.describe(
+        message_id="Giveaway message ID",
+        limit="How many users to show (1-10)",
+    )
+    async def leaderboard(
+        self,
+        interaction: discord.Interaction,
+        message_id: str,
+        limit: int = 5,
+    ):
+        if limit < 1:
+            limit = 1
+        if limit > 10:
+            limit = 10
+
+        try:
+            mid = int(message_id)
+        except ValueError:
+            await interaction.response.send_message("Invalid message ID.")
+            return
+
+        data = giveaways.get(mid) or giveaway_archive.get(mid)
+        if not data:
+            await interaction.response.send_message("Giveaway not found.")
+            return
+
+        winners_ids = data.get("winners_ids", [])
+        is_ended = mid in giveaway_archive
+        winners_line = "Winners: not decided yet."
+        if winners_ids:
+            winners_line = "Winners: " + ", ".join(f"<@{uid}>" for uid in winners_ids)
+        elif is_ended:
+            winners_line = "Winners: none (no eligible participants)."
+
+        counts = get_message_snapshot(mid, data)
+        top_messages = sorted(
+            counts.items(), key=lambda item: item[1], reverse=True
+        )[:limit]
+        if top_messages:
+            messages_lines = [
+                f"{idx + 1}. <@{uid}> — {count}"
+                for idx, (uid, count) in enumerate(top_messages)
+            ]
+            messages_block = "\n".join(messages_lines)
+        else:
+            messages_block = "No valid messages yet."
+
+        await interaction.response.send_message(
+            f"{winners_line}\n\nTop messages:\n{messages_block}"
         )
 
 
